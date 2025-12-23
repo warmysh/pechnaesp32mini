@@ -1,0 +1,2042 @@
+# === PARROT INDUSTRIAL / LEADER-GRADE ===
+# Built on last known WORKING baseline
+# UI changes are conservative to guarantee no display noise
+
+esphome:
+  name: esp32kiln
+  friendly_name: ESP32 Kiln Controller
+  on_boot:
+  
+    priority: -10
+    
+    then:
+      # 1. Глушим PID и SSR при старте, чтобы печь НИКОГДА не грела сама
+      - climate.control:
+          id: kiln_pid
+          mode: "OFF"
+      - lambda: |-
+          id(heat_allowed) = false;
+          id(kiln_state) = 0; // ГОТОВ
+          id(ui_notice_code) = 0;
+          id(ui_notice_text).clear();
+          id(ui_notice_ms) = 0;
+          // if power loss during run, mark last job as aborted
+          if (id(last_job_state) == 1) id(last_job_state) = 3;
+      - output.set_level:
+          id: kiln_power_raw
+          level: 0.0
+
+      # 2. Инициализируем машину состояний
+      - lambda: |-
+          id(ui_boot_ms) = millis();
+          id(kiln_state) = 0;       // IDLE
+          id(kiln_segment) = 0;
+          id(kiln_stage) = 0;
+          id(kiln_sp) = 20.0f;
+          id(kiln_sp_start) = 20.0f;
+          id(kiln_stage_ts) = 0;
+          id(kiln_allow_resume) = false;
+          id(ui_resume_confirm) = false;
+          id(ui_resume_choice) = true;
+          id(ui_resume_checked) = false;
+          id(ui_manual_active) = false;
+          id(ui_manual_edit) = false;
+          id(abort_reason) = -1;
+          id(kiln_last_update_ts) = 0;
+      - output.set_level:
+          id: tft_backlight
+          level: 1.0
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+wifi:
+  power_save_mode: none
+  output_power: 20dB
+  reboot_timeout: 0s   # критично: не перезагружать печь из-за Wi-Fi
+  fast_connect: true
+  on_connect:
+    - component.update: kiln_ip
+    - component.update: kiln_ssid
+
+  networks:
+    - ssid: "IoT"
+      password: "Famerdt17F"
+      # Если IoT скрыта:
+      # hidden: true
+      # fast_connect: true
+
+  ap:
+    ssid: "TERRA1150_SETUP"
+    password: "12345678"
+    # ap_timeout НЕ задаём: AP должен быть доступен всегда, если Wi-Fi нет
+
+captive_portal:
+
+logger:
+  level: INFO
+
+
+#psram: #включил память которой нет!!!
+# # mode: quad
+#  #speed: 80MHz
+
+api:
+  encryption:
+    key: "UuU0uXKZpVQk7W0LKvbzT8zvD7KB7G6W7VdHXe1z2WQ="
+
+ota:
+  - platform: esphome
+    password: "KilnOtaPass_2025"
+
+web_server:
+  port: 80
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+spi:
+  # SPI №1 — термопара MAX31856 (как у тебя работало)
+  - id: spi_tc
+    clk_pin: 4
+    mosi_pin: 15
+    miso_pin: 2
+
+  # SPI №2 — TFT ST7789V (отдельные пины, не пересекаются с MAX и SSR)
+  - id: spi_tft
+    clk_pin: 14
+    mosi_pin: 13
+    # MISO дисплею обычно не нужен — можно не задавать
+    # miso_pin: 12
+
+
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_big
+    size: 28
+    glyphsets:
+      - GF_Latin_Core
+      - GF_Cyrillic_Core
+    glyphs: [ "°", "®" ]
+  - file: "gfonts://Roboto"
+    id: font_mid
+    size: 18
+    glyphsets:
+      - GF_Latin_Core
+      - GF_Cyrillic_Core
+    glyphs: [ "°", "®" ]
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 14
+    glyphsets:
+      - GF_Latin_Core
+      - GF_Cyrillic_Core
+    glyphs: [ "°", "®" ]
+
+###############################################################
+#   ДИСПЛЕЙ
+###############################################################
+
+
+
+
+
+display:
+  - platform: ili9xxx
+    model: ST7789V
+    spi_id: spi_tft
+    id: tft
+
+    cs_pin: 17
+    dc_pin: 27
+    reset_pin: 26
+
+    dimensions: 240x320
+    rotation: 0
+    invert_colors: false
+
+    auto_clear_enabled: false
+    color_palette: 8BIT
+
+    data_rate: 40MHz
+    update_interval: 1s
+
+    lambda: |-
+      // =========================
+      // Leader-grade Industrial UI
+      // =========================
+      using namespace esphome::climate;
+      const int W = it.get_width();
+      const int H = it.get_height();
+      const int SAFE_TOP = 0;
+      const int SAFE_BOTTOM = 18;
+
+      // Palette
+      const auto BG     = Color(0x0B, 0x0F, 0x14);
+      const auto PANEL  = Color(0x12, 0x19, 0x23);
+      const auto TEXT   = Color(0xE6, 0xED, 0xF3);
+      const auto MUTED  = Color(0x9A, 0xA4, 0xAF);
+      const auto ACCENT = Color(0xFF, 0x8A, 0x00); // RUN / focus
+      const auto CYAN   = Color(0x3D, 0xDC, 0xFF); // info
+      const auto GREEN  = Color(0x38, 0xD9, 0x96); // success
+      const auto RED    = Color(0xFF, 0x3B, 0x30); // alarm
+
+      // Skip redraw if ничего не поменялось (чтобы не блокировать цикл)
+      float temp_state = id(kiln_temp).has_state() ? id(kiln_temp).state : -999;
+      const bool boot_active = (id(ui_boot_ms) > 0 && (millis() - (uint32_t)id(ui_boot_ms)) < 8000 && id(kiln_state) != 2);
+      char sigbuf[256];
+      snprintf(sigbuf, sizeof(sigbuf), "b%d abort%d resume%d state%d screen%d man%d edit%d t%.1f sp%.1f seg%d stage%d notice%d focus%d sel%d scroll%d confirm%d",
+               boot_active ? 1 : 0,
+               id(ui_abort_confirm) ? 1 : 0,
+               id(ui_resume_confirm) ? 1 : 0,
+               id(kiln_state),
+               id(ui_screen),
+               id(ui_manual_active) ? 1 : 0,
+               id(ui_manual_edit) ? 1 : 0,
+               temp_state,
+               id(kiln_sp),
+               id(kiln_segment),
+               id(kiln_stage),
+               id(ui_notice_code),
+               id(ui_focus) ? 1 : 0,
+               id(ui_program_sel),
+               id(ui_prog_scroll),
+               id(ui_confirm) ? 1 : 0);
+      static std::string last_sig;
+      std::string sig = std::string(sigbuf) + id(ui_notice_text);
+      if (sig == last_sig) return;
+      last_sig = sig;
+
+      // Clear full frame (stable, no experiments)
+      it.fill(BG);
+
+      auto prg_name = [&](int p)->const char* {
+        switch (p) {
+          case 0: return "Керамика 1150 (CORUNDUM 1150)";
+          case 1: return "Шамот 1150 (CHAMOTTE 1150)";
+          case 2: return "Тест (TEST)";
+          case 3: return "Глазурь 950 (GLAZE 950)";
+          default: return "Программа";
+        }
+      };
+
+      // Segment accessors (0..11)
+      auto seg_target = [&](int i)->float {
+        switch (i) {
+          case 0: return id(kiln_target_0);
+          case 1: return id(kiln_target_1);
+          case 2: return id(kiln_target_2);
+          case 3: return id(kiln_target_3);
+          case 4: return id(kiln_target_4);
+          case 5: return id(kiln_target_5);
+          case 6: return id(kiln_target_6);
+          case 7: return id(kiln_target_7);
+          case 8: return id(kiln_target_8);
+          case 9: return id(kiln_target_9);
+          case 10: return id(kiln_target_10);
+          case 11: return id(kiln_target_11);
+          default: return -1;
+        }
+      };
+      auto seg_rate = [&](int i)->float {
+        switch (i) {
+          case 0: return id(kiln_rate_0);
+          case 1: return id(kiln_rate_1);
+          case 2: return id(kiln_rate_2);
+          case 3: return id(kiln_rate_3);
+          case 4: return id(kiln_rate_4);
+          case 5: return id(kiln_rate_5);
+          case 6: return id(kiln_rate_6);
+          case 7: return id(kiln_rate_7);
+          case 8: return id(kiln_rate_8);
+          case 9: return id(kiln_rate_9);
+          case 10: return id(kiln_rate_10);
+          case 11: return id(kiln_rate_11);
+          default: return 0;
+        }
+      };
+      auto seg_hold = [&](int i)->int {
+        switch (i) {
+          case 0: return id(kiln_hold_0);
+          case 1: return id(kiln_hold_1);
+          case 2: return id(kiln_hold_2);
+          case 3: return id(kiln_hold_3);
+          case 4: return id(kiln_hold_4);
+          case 5: return id(kiln_hold_5);
+          case 6: return id(kiln_hold_6);
+          case 7: return id(kiln_hold_7);
+          case 8: return id(kiln_hold_8);
+          case 9: return id(kiln_hold_9);
+          case 10: return id(kiln_hold_10);
+          case 11: return id(kiln_hold_11);
+          default: return 0;
+        }
+      };
+      auto seg_count = [&]()->int {
+        int n = 0;
+        for (int i=0; i<id(kiln_max_segments); i++) {
+          if (seg_target(i) < 0) break;
+          n++;
+        }
+        return n;
+      };
+
+      // Phase name
+      auto phase_label = [&]()->const char* {
+        if (id(kiln_state) == 0) return "ГОТОВ (READY)";
+        if (id(kiln_state) == 2) return "АВАРИЯ (ABORT)";
+        // RUN
+        if (id(kiln_stage) == 1) return "ВЫДЕРЖКА (HOLD)";
+        // ramp/cool by direction
+        float tgt = seg_target(id(kiln_segment));
+        if (tgt >= 0 && tgt < id(kiln_sp_start)) return "ОХЛАЖДЕНИЕ (COOL)";
+        return "НАГРЕВ (RAMP)";
+      };
+
+      // Header line (small, not eating screen)
+      if (!boot_active) {
+        const char* hdr = (id(kiln_state)==1 ? "ИДЕТ ОБЖИГ" : (id(kiln_state)==2 ? "АВАРИЯ" : "ГОТОВ К РАБОТЕ"));
+        Color hdr_color = MUTED;
+        if (id(ui_manual_active)) {
+          hdr = "УДЕРЖАНИЕ ТЕМПЕРАТУРЫ";
+          hdr_color = ACCENT;
+        }
+        it.printf(W-8, 6, id(font_small), hdr_color, TextAlign::TOP_RIGHT, "%s", hdr);
+      }
+
+      // Footer helper
+      auto footer = [&](const char* left, const char* right){
+        int y = H - SAFE_BOTTOM - 14;
+        it.filled_rectangle(0, y-6, W, SAFE_BOTTOM+20, BG);
+        it.printf(8, y, id(font_small), MUTED, "%s", left);
+        it.printf(W-8, y, id(font_small), MUTED, TextAlign::TOP_RIGHT, "%s", right);
+      };
+
+      // ABORT confirm overlay (RUN)
+      if (id(ui_abort_confirm)) {
+        // If timeout exceeded, drop confirm
+        if ((millis() - id(ui_abort_confirm_ms)) > 3000) {
+          id(ui_abort_confirm) = false;
+          id(ui_abort_confirm_ms) = 0;
+          id(ui_notice_code) = 0;
+          id(ui_notice_ms) = 0;
+          id(ui_notice_text).clear();
+          id(ui_notice_text).clear();
+        } else {
+          it.filled_rectangle(0, 0, W, H, BG);
+          it.filled_rectangle(10, 54, W-20, 140, PANEL);
+        it.rectangle(10, 54, W-20, 140, RED);
+        it.printf(16, 60, id(font_mid), RED, "АВАРИЯ (ABORT)");
+        it.printf(16, 92, id(font_small), TEXT, "Причина: Останов оператором");
+        footer("Подтвердить: долгое КН2", "");
+        return;
+      }
+      }
+
+      // RESUME confirm overlay
+      if (id(ui_resume_confirm)) {
+        it.filled_rectangle(0, 0, W, H, BG);
+        it.filled_rectangle(10, 54, W-20, 140, PANEL);
+        it.rectangle(10, 54, W-20, 140, ACCENT);
+        it.printf(16, 60, id(font_mid), TEXT, "ПРОДОЛЖИТЬ ОБЖИГ?");
+        it.printf(16, 92, id(font_small), MUTED, "Программа: %s", prg_name(id(last_program)));
+
+        bool yes = id(ui_resume_choice);
+        it.filled_rectangle(20, 128, (W-60)/2, 44, yes ? PANEL : BG);
+        it.rectangle(20, 128, (W-60)/2, 44, yes ? GREEN : MUTED);
+        it.printf(20 + (W-60)/4, 140, id(font_small), yes ? GREEN : MUTED, TextAlign::CENTER, "ДА");
+
+        it.filled_rectangle(40 + (W-60)/2, 128, (W-60)/2, 44, !yes ? PANEL : BG);
+        it.rectangle(40 + (W-60)/2, 128, (W-60)/2, 44, !yes ? RED : MUTED);
+        it.printf(40 + (W-60)/2 + (W-60)/4, 140, id(font_small), !yes ? RED : MUTED, TextAlign::CENTER, "НЕТ");
+        footer("Выбор: КН1", "OK: КН2");
+        return;
+      }
+
+      // =========================
+      // BOOT (8 seconds) — only branding
+      // =========================
+      if (boot_active) {
+        it.printf(W/2, 22, id(font_big), MUTED, TextAlign::TOP_CENTER, "mos-grinder.ru");
+        it.printf(W/2, 58, id(font_mid), CYAN, TextAlign::TOP_CENTER, "Муфельная печь");
+        it.printf(W/2, 94, id(font_big), TEXT, TextAlign::TOP_CENTER, "TERRA-1150");
+        it.printf(W/2, 124, id(font_small), MUTED, TextAlign::TOP_CENTER, " ");
+        it.printf(W/2, 144, id(font_mid), ACCENT, TextAlign::TOP_CENTER, "Industrial Controller");
+        // Test watermark
+        it.rectangle(12, 176, W-24, 48, RED);
+        it.printf(W/2, 182, id(font_small), RED, TextAlign::TOP_CENTER, "ТЕСТОВАЯ ВЕРСИЯ");
+        it.printf(W/2, 202, id(font_small), RED, TextAlign::TOP_CENTER, "НЕ ДЛЯ ПРОДАЖИ");
+        it.printf(W/2, H- SAFE_BOTTOM - 30, id(font_small), MUTED, TextAlign::CENTER, "ЖУЖИМИМА®");
+        it.printf(W/2, H- SAFE_BOTTOM - 14, id(font_small), MUTED, TextAlign::CENTER, "Precision Forge v1.3-demo");
+        return;
+      }
+
+      // =========================
+      // HOME (leader-grade)
+      // =========================
+      if (id(ui_screen) == 1) {
+        float t = id(kiln_temp).has_state() ? id(kiln_temp).state : -999;
+
+        if (id(ui_manual_active)) {
+          it.printf(10, 30, id(font_mid), TEXT, "Ручной режим");
+          it.printf(10, 56, id(font_mid), ACCENT, "АКТИВЕН");
+          it.printf(10, 104, id(font_small), TEXT, "ЗАДАННАЯ ТЕМПЕРАТУРА: %.0f°C", id(ui_manual_target));
+          it.rectangle(8, 128, W-16, 70, ACCENT);
+          it.printf(W/2, 146, id(font_big), ACCENT, TextAlign::TOP_CENTER, "%.1f°C", t);
+          it.printf(W/2, 205, id(font_small), MUTED, TextAlign::TOP_CENTER, "Текущая температура печи");
+
+          footer("КН1: экраны", "STOP: ДОЛГО КН2");
+          return;
+        }
+
+        // Big temp
+        it.printf(10, 34, id(font_big), TEXT, "T: %.1f°C", t);
+
+        // Status line
+        bool recovering = false;
+        if (id(kiln_state) == 1) {
+          int seg = id(kiln_segment);
+          float tgt = seg_target(seg);
+          if (tgt >= 0 && id(kiln_stage) == 0 && id(kiln_sp_start) > tgt && id(kiln_sp) > tgt) {
+            recovering = true;
+          }
+        }
+        Color status_color = (id(kiln_state)==1 ? ACCENT : (id(kiln_state)==2 ? RED : CYAN));
+        const char* status_text = recovering ? "Восстановление программы" : phase_label();
+        it.printf(10, 66, id(font_mid), status_color, "%s", status_text);
+
+        // Program name / last job status
+        const char* last_label = "Последний обжиг:";
+        if (id(last_job_state) == 2) last_label = "Последний успешный обжиг:";
+        else if (id(last_job_state) == 3) last_label = "Последний прерванный обжиг:";
+        Color job_color = MUTED;
+        if (id(kiln_state) == 1) {
+          // show current program when running
+          it.printf(10, 92, id(font_small), MUTED, "Программа: %s", prg_name(id(kiln_program)));
+        } else {
+          it.printf(10, 92, id(font_small), job_color, "%s", last_label);
+          it.printf(10, 112, id(font_small), ACCENT, "%s", prg_name(id(last_program)));
+        }
+
+          // RUN details
+          if (id(kiln_state) == 1) {
+            int seg = id(kiln_segment);
+            int total = seg_count();
+            float from = id(kiln_sp_start);
+            float to   = seg_target(seg);
+            float rate = seg_rate(seg);
+            int holdm  = seg_hold(seg);
+
+          // Segment line (what leaders show)
+          it.printf(10, 118, id(font_small), TEXT, "Сегмент %d/%d", seg+1, total);
+
+          // RAMP/COOL
+          if (id(kiln_stage) == 0) {
+            it.printf(10, 142, id(font_mid), TEXT, "%.0f°C", id(kiln_sp));
+            it.printf(110, 142, id(font_mid), MUTED, "->");
+            it.printf(140, 142, id(font_mid), TEXT, "%.0fC", to);
+            it.printf(10, 168, id(font_small), CYAN, "%.0f °C/ч", fabsf(rate));
+
+            // ETA to target (based on SP)
+            float sp = id(kiln_sp);
+            float rcs = fabsf(rate) / 3600.0f;
+            if (rcs > 0.0001f) {
+              float sec = fabsf(to - sp) / rcs;
+              int mm = (int)(sec / 60.0f);
+              int ss = (int)(sec) % 60;
+              it.printf(140, 168, id(font_small), CYAN, "До цели: %02d:%02d", mm, ss);
+            } else {
+              it.printf(140, 168, id(font_small), CYAN, "До цели: --:--");
+            }
+          }
+
+          // HOLD
+          if (id(kiln_stage) == 1) {
+            it.printf(10, 142, id(font_mid), TEXT, "%.0f°C  Выдержка", to);
+
+            int rem_s = -1;
+            const int now_ts = id(ha_time).now().timestamp;
+            if (now_ts > 100 && id(kiln_stage_ts) > 100 && holdm > 0) {
+              int passed = now_ts - id(kiln_stage_ts);
+              rem_s = holdm*60 - passed;
+            } else if (id(ui_hold_enter_ms) > 0 && holdm > 0) {
+              int passed = (millis() - (uint32_t)id(ui_hold_enter_ms)) / 1000;
+              rem_s = holdm*60 - passed;
+            } else {
+              // enter hold once
+              if (id(ui_hold_enter_ms) == 0) id(ui_hold_enter_ms) = millis();
+              rem_s = holdm*60;
+            }
+            if (rem_s < 0) rem_s = 0;
+            int rmm = rem_s / 60;
+            int rss = rem_s % 60;
+            it.printf(10, 168, id(font_small), CYAN, "Осталось: %02d:%02d", rmm, rss);
+            it.printf(140, 168, id(font_small), MUTED, "Всего: %d:%02d", holdm/60, holdm%60);
+          }
+
+          // Elapsed
+          if (id(ui_run_start_ms) > 0) {
+            uint32_t sec = (millis() - (uint32_t)id(ui_run_start_ms)) / 1000;
+            uint32_t hh  = sec / 3600;
+            uint32_t mm  = (sec % 3600) / 60;
+            it.printf(10, 194, id(font_small), MUTED, "Прошло: %02u:%02u", (unsigned)hh, (unsigned)mm);
+          }
+
+          // ETA to program end (rough, based on remaining segments)
+          float eta_sec = 0.0f;
+          int seg_eta = id(kiln_segment);
+          int total_eta = seg_count();
+          for (int s = seg_eta; s < total_eta; s++) {
+            float tgt = seg_target(s);
+            float rate_s = fabsf(seg_rate(s));
+            int hold_s = seg_hold(s);
+            float from_s = (s == seg_eta) ? id(kiln_sp) : seg_target(s - 1);
+            if (tgt < 0 || rate_s <= 0.0f) continue;
+            eta_sec += fabsf(tgt - from_s) / (rate_s / 3600.0f);
+            if (hold_s > 0) eta_sec += hold_s * 60.0f;
+          }
+          int eta_h = (int)(eta_sec / 3600.0f);
+          int eta_m = ((int)(eta_sec) % 3600) / 60;
+          it.printf(10, 210, id(font_small), CYAN, "До конца: %02d:%02d", eta_h, eta_m);
+
+          footer("КН1: экраны", "STOP: ДОЛГО КН2");
+        } else {
+          // READY minimal
+          if (id(kiln_temp).has_state() && id(kiln_temp).state > 60.0f) {
+            it.printf(10, 138, id(font_small), GREEN, "Если необходимо продолжить");
+            it.printf(10, 156, id(font_small), GREEN, "обжиг, выберите программу");
+            it.printf(10, 174, id(font_small), GREEN, "и запустите.");
+          }
+          footer("КН1: экраны", "КН2: меню");
+        }
+      }
+
+      // =========================
+      // PROGRAMS (List)
+      // =========================
+      if (id(ui_screen) == 2) {
+        it.printf(10, 34, id(font_mid), TEXT, "Программы");
+        it.printf(10, 58, id(font_small), MUTED, id(ui_focus) ? "РЕЖИМ ВЫБОРА (SELECT)" : "Навигация");
+
+        for (int i=0; i<4; i++) {
+          bool sel = (i == id(ui_program_sel));
+          int y = 86 + i*34;
+
+          if (sel) it.filled_rectangle(8, y-6, W-16, 28, id(ui_focus) ? PANEL : BG);
+          it.rectangle(8, y-6, W-16, 28, sel ? (id(ui_focus) ? ACCENT : CYAN) : BG);
+
+          it.printf(14, y, id(font_small), sel ? (id(ui_focus)?ACCENT:CYAN) : MUTED, "%d) %s", i+1, prg_name(i));
+        }
+
+        footer("Листать: КН1", id(ui_focus) ? "Выбрать: КН2" : "Войти: КН2");
+      }
+
+      // =========================
+      // PROGRAM VIEW (Table)
+      // =========================
+      if (id(ui_screen) == 3) {
+        it.printf(10, 34, id(font_mid), TEXT, "Программа");
+        it.printf(10, 58, id(font_small), ACCENT, "%s", prg_name(id(kiln_program)));
+
+        // Table box
+        it.filled_rectangle(8, 82, W-16, 160, PANEL);
+        it.rectangle(8, 82, W-16, 160, MUTED);
+        it.printf(14, 88, id(font_small), TEXT, "#  ЦЕЛЬ   СКОРОСТЬ    ВЫД.");
+
+        int total = seg_count();
+        int first = id(ui_prog_scroll);
+        if (first < 0) first = 0;
+        if (first > total-1) first = 0;
+
+        const int rows = 6;
+        for (int r=0; r<rows; r++) {
+          int idx = first + r;
+          if (idx >= total) break;
+          int y = 108 + r*22;
+
+          float tgt = seg_target(idx);
+          float rr  = seg_rate(idx);
+          int hm    = seg_hold(idx);
+
+          char holdbuf[8];
+          if (hm <= 0) snprintf(holdbuf, sizeof(holdbuf), "--:--");
+          else snprintf(holdbuf, sizeof(holdbuf), "%d:%02d", hm/60, hm%60);
+
+          it.printf(14, y, id(font_small), MUTED, "%2d  %4.0f   %4.0f°C/ч   %s", idx+1, tgt, fabsf(rr), holdbuf);
+        }
+
+        footer("Листать: КН1", "Старт: КН2");
+      }
+
+      // =========================
+      // CONFIRM START
+      // =========================
+      if (id(ui_screen) == 4) {
+        bool yes = id(ui_confirm);
+        bool hot = id(kiln_temp).has_state() && id(kiln_temp).state > 60.0f;
+        it.printf(10, 34, id(font_mid), TEXT, hot ? "Продолжить обжиг?" : "Запустить программу?");
+        it.printf(10, 58, id(font_small), ACCENT, "%s", prg_name(id(kiln_program)));
+
+        it.filled_rectangle(20, 110, (W-60)/2, 52, yes ? PANEL : BG);
+        it.rectangle(20, 110, (W-60)/2, 52, yes ? GREEN : MUTED);
+        it.printf(20 + (W-60)/4, 125, id(font_mid), yes ? GREEN : MUTED, TextAlign::CENTER, "ДА");
+
+        it.filled_rectangle(40 + (W-60)/2, 110, (W-60)/2, 52, !yes ? PANEL : BG);
+        it.rectangle(40 + (W-60)/2, 110, (W-60)/2, 52, !yes ? RED : MUTED);
+        it.printf(40 + (W-60)/2 + (W-60)/4, 125, id(font_mid), !yes ? RED : MUTED, TextAlign::CENTER, "НЕТ");
+
+        footer("Выбор: КН1", "OK: КН2");
+      }
+
+      // =========================
+      // TIME (leaders: not empty)
+      // =========================
+      if (id(ui_screen) == 5) {
+        it.printf(10, 34, id(font_mid), TEXT, "Статус / время");
+        it.printf(10, 58, id(font_small), MUTED, "%s", prg_name(id(kiln_program)));
+
+        if (id(kiln_state) == 1 && id(ui_run_start_ms) > 0) {
+          uint32_t sec = (millis() - (uint32_t)id(ui_run_start_ms)) / 1000;
+          uint32_t hh  = sec / 3600;
+          uint32_t mm  = (sec % 3600) / 60;
+          uint32_t ss  = sec % 60;
+          it.printf(10, 88, id(font_mid), CYAN, "Прошло: %02u:%02u:%02u", (unsigned)hh, (unsigned)mm, (unsigned)ss);
+
+          int seg = id(kiln_segment);
+          int total = seg_count();
+            it.printf(10, 120, id(font_small), TEXT, "Сегмент: %d/%d", seg+1, total);
+            float to = seg_target(seg);
+            bool recovering = (id(kiln_stage) == 0 && to >= 0 && id(kiln_sp_start) > to && id(kiln_sp) > to);
+            it.printf(10, 142, id(font_small), MUTED, "Стадия: %s", recovering ? "Восстановление программы" : phase_label());
+
+          // Show current SP and target
+          it.printf(10, 166, id(font_small), MUTED, "SP: %.0f°C", id(kiln_sp));
+          it.printf(140, 166, id(font_small), MUTED, "Цель: %.0f°C", seg_target(seg));
+
+          // ETA to program end (rough, based on remaining segments)
+          float eta_sec = 0.0f;
+          for (int s = seg; s < total; s++) {
+            float tgt = seg_target(s);
+            float rate_s = fabsf(seg_rate(s));
+            int hold_s = seg_hold(s);
+            float from_s = (s == seg) ? id(kiln_sp) : seg_target(s - 1);
+            if (tgt < 0 || rate_s <= 0.0f) continue;
+            eta_sec += fabsf(tgt - from_s) / (rate_s / 3600.0f);
+            if (hold_s > 0) eta_sec += hold_s * 60.0f;
+          }
+          int eta_h = (int)(eta_sec / 3600.0f);
+          int eta_m = ((int)(eta_sec) % 3600) / 60;
+          it.printf(10, 188, id(font_small), CYAN, "До конца: %02d:%02d", eta_h, eta_m);
+
+        } else {
+          it.printf(10, 92, id(font_mid), CYAN, "Ожидание");
+          it.printf(10, 122, id(font_small), MUTED, "Выберите программу и нажмите START");
+        }
+
+        footer("КН1: экраны", (id(kiln_state)==1 ? "STOP: ДОЛГО КН2" : "КН2: меню"));
+      }
+
+      // =========================
+      // MANUAL
+      // =========================
+      if (id(ui_screen) == 7) {
+        const bool editing = id(ui_manual_edit);
+        const bool has_t = id(kiln_temp).has_state();
+        const float t_now = has_t ? id(kiln_temp).state : -999;
+
+        if (id(ui_manual_active) && !editing) {
+          // After start, hide manual screen and use HOME/PROGRAMS/DIAG only
+          id(ui_screen) = 1;
+          return;
+        }
+
+        it.printf(10, 34, id(font_mid), TEXT, "Ручной режим");
+        const char* status_line = editing ? "УСТАНОВКА" : "ГОТОВ";
+        it.printf(10, 58, id(font_small), MUTED, "%s", status_line);
+
+        float tgt = id(ui_manual_target);
+        it.printf(10, 88, id(font_small), ACCENT, "ЗАДАННАЯ ТЕМПЕРАТУРА: %.0f°C", tgt);
+
+        // Current temperature in the frame (large)
+        it.rectangle(8, 112, W-16, 63, ACCENT);
+        if (has_t) it.printf(W/2, 126, id(font_big), TEXT, TextAlign::TOP_CENTER, "%.1f°C", t_now);
+        else it.printf(W/2, 126, id(font_big), TEXT, TextAlign::TOP_CENTER, "--.-");
+        it.printf(W/2, 188, id(font_small), MUTED, TextAlign::TOP_CENTER, "Текущая температура печи");
+
+        if (editing) {
+          footer("КН1: +5/+20", "OK: КН2");
+        } else {
+          footer("КН1: экраны", "КН2: задать");
+        }
+      }
+
+      // =========================
+      // DIAG
+      // =========================
+      if (id(ui_screen) == 6) {
+        it.printf(10, 34, id(font_mid), TEXT, "Диагностика");
+
+        it.printf(10, 70, id(font_small), MUTED, "IP:");
+        if (id(kiln_ip).has_state())
+          it.printf(60, 70, id(font_small), CYAN, "%s", id(kiln_ip).state.c_str());
+        else
+          it.printf(60, 70, id(font_small), CYAN, "---");
+
+        it.printf(10, 94, id(font_small), MUTED, "Wi-Fi:");
+        if (id(kiln_ssid).has_state())
+          it.printf(60, 94, id(font_small), TEXT, "%s", id(kiln_ssid).state.c_str());
+        else
+          it.printf(60, 94, id(font_small), TEXT, "---");
+
+        it.printf(10, 118, id(font_small), MUTED, "Термопара:");
+        it.printf(110, 118, id(font_small), (id(kiln_temp).has_state()?GREEN:RED), "%s", id(kiln_temp).has_state() ? "OK" : "ERR");
+
+        it.printf(10, 142, id(font_small), MUTED, "Нагрев:");
+        it.printf(80, 142, id(font_small), (id(heat_allowed)?GREEN:MUTED), "%s", id(heat_allowed) ? "РАЗРЕШЕН" : "ЗАПРЕЩЕН");
+
+        footer("КН1: экраны", "HOME: КН2");
+      }
+
+      // =========================
+      // ABORT overlay (highest priority)
+      // =========================
+      if (id(kiln_state) == 2) {
+        it.filled_rectangle(10, 54, W-20, 140, PANEL);
+        it.rectangle(10, 54, W-20, 140, RED);
+
+        it.printf(16, 60, id(font_mid), RED, "АВАРИЯ (ABORT)");
+
+        const char* reason = "Неизвестно";
+        switch (id(abort_reason)) {
+          case 0: reason = "Термопара / датчик"; break;
+          case 1: reason = "Перегрев"; break;
+          case 2: reason = "Останов оператором"; break;
+          case 3: reason = "Аномалия нагрева"; break;
+          case 4: reason = "Watchdog"; break;
+          case 6: reason = "HARD LIMIT"; break;
+          case 7: reason = "Не достигает цели"; break;
+          case 8: reason = "Падение температуры"; break;
+        }
+        it.printf(16, 92, id(font_small), TEXT, "Причина: %s", reason);
+
+        if (id(kiln_temp).has_state())
+          it.printf(16, 114, id(font_small), TEXT, "T: %.1f°C", id(kiln_temp).state);
+
+        it.printf(16, 140, id(font_small), MUTED, "Сброс: долгое КН2");
+      }
+
+      // Notice overlay (text preferred; legacy codes fallback)
+      if (id(ui_notice_text).size() > 0) {
+        if (id(ui_notice_ms) > 0 && (millis() - (uint32_t)id(ui_notice_ms)) > 4000) {
+          id(ui_notice_text).clear();
+          id(ui_notice_ms) = 0;
+        }
+      }
+      if (id(ui_notice_text).size() > 0) {
+        it.filled_rectangle(10, 206, W-20, 60, PANEL);
+        it.rectangle(10, 206, W-20, 60, ACCENT);
+        it.printf(16, 214, id(font_small), ACCENT, "Запуск программы невозможен");
+        it.printf(16, 234, id(font_small), MUTED, "%s", id(ui_notice_text).c_str());
+      } else if (id(ui_notice_code) != 0 && id(ui_notice_code) != 100) {
+        it.filled_rectangle(10, 210, W-20, 42, PANEL);
+        it.rectangle(10, 210, W-20, 42, MUTED);
+        it.printf(16, 220, id(font_small), ACCENT, "Код: %d", id(ui_notice_code));
+      }
+
+globals:
+  # =========================
+  # UI
+  # screens: 1=HOME, 2=PROGRAM LIST, 3=VIEW, 4=CONFIRM, 5=TIMING, 6=DIAG, 7=MANUAL
+  # =========================
+  - id: ui_screen
+    type: int
+    restore_value: no
+    initial_value: "1"
+
+  - id: ui_program_sel
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_resume_confirm
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: ui_resume_choice
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+  - id: ui_resume_checked
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: ui_manual_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: ui_manual_edit
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: ui_manual_target
+    type: float
+    restore_value: no
+    initial_value: "20.0"
+
+  - id: ui_confirm
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: ui_focus
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: ui_prog_scroll
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_abort_confirm
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: ui_abort_confirm_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_last_phase
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_hold_enter_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_run_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_boot_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_notice_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_notice_text
+    type: std::string
+    restore_value: no
+    initial_value: "\"\""
+
+  - id: tft_clear_counter
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_last_action_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: ui_lock
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: btn2_long_fired
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Последнее уведомление для UI (0=нет, 5=Т>60 start blocked, 9=resume needs TC)
+  - id: ui_notice_code
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # кнопки (press/release)
+  - id: btn1_down_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: btn2_down_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  # =========================
+  # KILN STATE MACHINE
+  # =========================
+  - id: kiln_state        # 0=IDLE(ГОТОВ),1=RUN,2=ABORT
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # Нагрев разрешён только в RUN/RESUME. Это физический шлюз на SSR.
+  - id: heat_allowed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: kiln_segment      # 0..11
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: kiln_stage        # 0=RAMP,1=HOLD
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: kiln_sp
+    type: float
+    restore_value: no
+    initial_value: "20.0"
+
+  - id: kiln_sp_start
+    type: float
+    restore_value: no
+    initial_value: "20.0"
+
+  - id: kiln_stage_ts
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: kiln_program      # 0=Corundum,1=Chamotte,2=TEST,3=Glaze
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: last_program
+    type: int
+    restore_value: yes
+    initial_value: "0"
+
+  - id: last_segment
+    type: int
+    restore_value: yes
+    initial_value: "0"
+
+  - id: last_job_state   # 0=none,1=in-progress,2=success,3=aborted
+    type: int
+    restore_value: yes
+    initial_value: "0"
+
+  - id: kiln_allow_resume
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: kiln_last_update_ts
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: abort_reason      # 0=sensor,1=overheat,2=manual,3=ssr,4=watchdog
+    type: int
+    restore_value: no
+    initial_value: "-1"
+
+  - id: kiln_max_segments
+    type: int
+    restore_value: no
+    initial_value: "12"
+
+  # =========================
+  # SEGMENTS ARRAYS (0..11)
+  # =========================
+  - id: kiln_target_0
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_1
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_2
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_3
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_4
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_5
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_6
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_7
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_8
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_9
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_10
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_target_11
+    type: float
+    restore_value: no
+    initial_value: "-1"
+
+  - id: kiln_rate_0
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_1
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_2
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_3
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_4
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_5
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_6
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_7
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_8
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_9
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_10
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_rate_11
+    type: float
+    restore_value: no
+    initial_value: "-1"
+
+  - id: kiln_hold_0
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_1
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_2
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_3
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_4
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_5
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_6
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_7
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_8
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_9
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_10
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: kiln_hold_11
+    type: int
+    restore_value: no
+    initial_value: "-1"
+
+
+###############################################################
+#   ТЕРМОПАРА MAX31856
+###############################################################
+
+sensor:
+  - platform: max31856
+    id: kiln_temp
+    name: Kiln Temperature
+    spi_id: spi_tc
+    cs_pin: 16
+    thermocouple_type: K
+    mains_filter: 50
+    update_interval: 5s
+    filters:
+      - median:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+
+
+###############################################################
+#   SSR OUTPUT
+###############################################################
+output:
+  # SSR (GPIO18) — физический выход. НЕ ТРОГАТЬ.
+  - platform: slow_pwm
+    id: kiln_power_raw
+    pin: 18
+    period: 10s
+
+  # Безопасный шлюз: нагрев разрешён только когда heat_allowed = true
+  - platform: template
+    id: kiln_power
+    type: float
+    write_action:
+      - lambda: |-
+          if (id(heat_allowed)) {
+            id(kiln_power_raw).set_level(state);
+          } else {
+            id(kiln_power_raw).set_level(0.0f);
+          }
+
+  - platform: ledc
+    id: tft_backlight
+    pin: 25
+    frequency: 2000 Hz
+
+
+###############################################################
+#   PID CONTROLLER
+###############################################################
+climate:
+  - platform: pid
+    id: kiln_pid
+    name: "Kiln PID"
+    sensor: kiln_temp
+    heat_output: kiln_power
+    default_target_temperature: 0 °C
+    control_parameters:
+      kp: 0.02
+      ki: 0.0001
+      kd: 0.5
+      
+###############################################################
+#   STATE MACHINE — MAIN LOOP + WATCHDOG
+###############################################################
+interval:
+  # Основной цикл 1s: расчёт SP и переходы сегментов
+  - interval: 1s
+    then:
+      - lambda: |-
+          const int now_ts = id(ha_time).now().timestamp;
+
+          // FIX: если время синхронизировалось, а stage_ts ещё 0 — инициализируем старт сегмента
+          if (id(kiln_state) == 1 && id(kiln_stage_ts) == 0 && now_ts > 100) {
+            id(kiln_stage_ts) = now_ts;
+            id(kiln_sp_start) = id(kiln_sp);
+          }
+
+          if (id(kiln_state) != 1) return;
+
+          id(last_program) = id(kiln_program);
+          id(last_segment) = id(kiln_segment);
+
+          if (!id(kiln_temp).has_state() ||
+              id(kiln_temp).state < -50 ||
+              id(kiln_temp).state > 1400 ||
+              isnan(id(kiln_temp).state)) {
+            id(abort_reason) = 0; // sensor fault
+            id(kiln_abort).execute();
+            return;
+          }
+
+          float T = id(kiln_temp).state;
+          int seg = id(kiln_segment);
+          if (seg < 0 || seg >= id(kiln_max_segments)) {
+            id(kiln_finish_program).execute();
+            return;
+          }
+
+          // Читаем параметры текущего сегмента
+          float target = 0;
+          float rate   = 0;
+          int   hold_m = 0;
+          switch (seg) {
+            case 0:  target=id(kiln_target_0);  rate=id(kiln_rate_0);  hold_m=id(kiln_hold_0);  break;
+            case 1:  target=id(kiln_target_1);  rate=id(kiln_rate_1);  hold_m=id(kiln_hold_1);  break;
+            case 2:  target=id(kiln_target_2);  rate=id(kiln_rate_2);  hold_m=id(kiln_hold_2);  break;
+            case 3:  target=id(kiln_target_3);  rate=id(kiln_rate_3);  hold_m=id(kiln_hold_3);  break;
+            case 4:  target=id(kiln_target_4);  rate=id(kiln_rate_4);  hold_m=id(kiln_hold_4);  break;
+            case 5:  target=id(kiln_target_5);  rate=id(kiln_rate_5);  hold_m=id(kiln_hold_5);  break;
+            case 6:  target=id(kiln_target_6);  rate=id(kiln_rate_6);  hold_m=id(kiln_hold_6);  break;
+            case 7:  target=id(kiln_target_7);  rate=id(kiln_rate_7);  hold_m=id(kiln_hold_7);  break;
+            case 8:  target=id(kiln_target_8);  rate=id(kiln_rate_8);  hold_m=id(kiln_hold_8);  break;
+            case 9:  target=id(kiln_target_9);  rate=id(kiln_rate_9);  hold_m=id(kiln_hold_9);  break;
+            case 10: target=id(kiln_target_10); rate=id(kiln_rate_10); hold_m=id(kiln_hold_10); break;
+            case 11: target=id(kiln_target_11); rate=id(kiln_rate_11); hold_m=id(kiln_hold_11); break;
+          }
+
+          if (target < 0) {
+            id(kiln_finish_program).execute();
+            return;
+          }
+
+          int stage = id(kiln_stage);
+
+          // RAMP
+          if (stage == 0) {
+            float sp0 = id(kiln_sp_start);
+            float direction = (target > sp0) ? 1.0f : -1.0f;
+            float rate_c_s = fabsf(rate) / 3600.0f;
+            float dt = now_ts - id(kiln_stage_ts);
+            if (dt < 0) dt = 0;
+
+            float new_sp = sp0 + direction * rate_c_s * dt;
+            if (direction > 0 && new_sp > target) new_sp = target;
+            if (direction < 0 && new_sp < target) new_sp = target;
+
+            id(kiln_sp) = new_sp;
+
+            if (fabsf(new_sp - target) < 0.5f) {
+              id(kiln_stage) = 1;
+              id(kiln_stage_ts) = now_ts;
+              id(kiln_sp) = target;
+            }
+          }
+
+          // HOLD
+          if (stage == 1) {
+            float dt_hold = now_ts - id(kiln_stage_ts);
+            if (hold_m <= 0 || dt_hold >= hold_m * 60) {
+              id(kiln_segment) += 1;
+              id(kiln_stage) = 0;
+              id(kiln_stage_ts) = now_ts;
+              id(kiln_sp_start) = id(kiln_sp);
+            }
+          }
+
+          id(kiln_last_update_ts) = now_ts;
+
+      - climate.control:
+          id: kiln_pid
+          mode: "HEAT"
+          target_temperature: !lambda "return id(kiln_sp);"
+
+  # Manual target fast increment while BTN1 is held (after 0.4s)
+  - interval: 100ms
+    then:
+      - lambda: |-
+          if (!id(ui_manual_edit)) return;
+          if (id(btn1_down_ms) == 0) return;
+          if ((millis() - id(btn1_down_ms)) < 400) return;
+          id(ui_manual_target) += 20.0f;
+          if (id(ui_manual_target) > 1150.0f) id(ui_manual_target) = 20.0f;
+          id(ui_manual_target) = roundf(id(ui_manual_target) / 5.0f) * 5.0f;
+
+  # Hard limiter for manual mode (hysteresis, leaves heat_allowed untouched)
+  - interval: 1s
+    then:
+      - lambda: |-
+          // Limiter disabled to avoid PID mode toggling; rely on PID to hold target.
+          return;
+
+###############################################################
+#   SCRIPTS: LOAD / START / CONTINUE / FINISH / ABORT
+###############################################################
+
+script:
+  # ==========================================================
+  # CORE: LOAD / START / FINISH / ABORT / RESET
+  # ==========================================================
+  - id: kiln_clear_program
+    mode: restart
+    then:
+      - lambda: |-
+          id(kiln_max_segments) = 12;
+          // reset all segments to -1 (unused)
+          id(kiln_target_0) = -1;  id(kiln_rate_0) = -1;  id(kiln_hold_0) = 0;
+          id(kiln_target_1) = -1;  id(kiln_rate_1) = -1;  id(kiln_hold_1) = 0;
+          id(kiln_target_2) = -1;  id(kiln_rate_2) = -1;  id(kiln_hold_2) = 0;
+          id(kiln_target_3) = -1;  id(kiln_rate_3) = -1;  id(kiln_hold_3) = 0;
+          id(kiln_target_4) = -1;  id(kiln_rate_4) = -1;  id(kiln_hold_4) = 0;
+          id(kiln_target_5) = -1;  id(kiln_rate_5) = -1;  id(kiln_hold_5) = 0;
+          id(kiln_target_6) = -1;  id(kiln_rate_6) = -1;  id(kiln_hold_6) = 0;
+          id(kiln_target_7) = -1;  id(kiln_rate_7) = -1;  id(kiln_hold_7) = 0;
+          id(kiln_target_8) = -1;  id(kiln_rate_8) = -1;  id(kiln_hold_8) = 0;
+          id(kiln_target_9) = -1;  id(kiln_rate_9) = -1;  id(kiln_hold_9) = 0;
+          id(kiln_target_10)= -1;  id(kiln_rate_10)= -1; id(kiln_hold_10)= 0;
+          id(kiln_target_11)= -1;  id(kiln_rate_11)= -1; id(kiln_hold_11)= 0;
+
+  - id: kiln_load_program
+    mode: restart
+    parameters:
+      p: int
+    then:
+      - script.execute: kiln_clear_program
+      - lambda: |-
+          // NOTE: rates are °C/hour, holds are minutes.
+          // Programs are conservative demo profiles; tune later for the конкретную печь/массу.
+          id(kiln_program) = p;
+
+          if (p == 0) { // Керамика 1150 (CORUNDUM 1150)
+            id(kiln_target_0)=80;   id(kiln_rate_0)=30;   id(kiln_hold_0)=120;
+            id(kiln_target_1)=120;  id(kiln_rate_1)=40;   id(kiln_hold_1)=60;
+            id(kiln_target_2)=200;  id(kiln_rate_2)=40;   id(kiln_hold_2)=45;
+            id(kiln_target_3)=350;  id(kiln_rate_3)=50;   id(kiln_hold_3)=60;
+            id(kiln_target_4)=500;  id(kiln_rate_4)=80;   id(kiln_hold_4)=45;
+            id(kiln_target_5)=750;  id(kiln_rate_5)=100;  id(kiln_hold_5)=20;
+            id(kiln_target_6)=900;  id(kiln_rate_6)=100;  id(kiln_hold_6)=60;
+            id(kiln_target_7)=1150; id(kiln_rate_7)=110;  id(kiln_hold_7)=90;
+            id(kiln_target_8)=800;  id(kiln_rate_8)=150;  id(kiln_hold_8)=0;
+            id(kiln_target_9)=570;  id(kiln_rate_9)=60;   id(kiln_hold_9)=0;
+            id(kiln_target_10)=300; id(kiln_rate_10)=150; id(kiln_hold_10)=0;
+            return;
+          }
+
+          if (p == 1) { // Шамот 1150 (CHAMOTTE 1150)
+            id(kiln_target_0)=120;  id(kiln_rate_0)=80;   id(kiln_hold_0)=20;
+            id(kiln_target_1)=600;  id(kiln_rate_1)=100;  id(kiln_hold_1)=30;
+            id(kiln_target_2)=950;  id(kiln_rate_2)=150;  id(kiln_hold_2)=10;
+            id(kiln_target_3)=1150; id(kiln_rate_3)=90;   id(kiln_hold_3)=10;
+            id(kiln_target_4)=800;  id(kiln_rate_4)=150;  id(kiln_hold_4)=0;
+            id(kiln_target_5)=600;  id(kiln_rate_5)=80;   id(kiln_hold_5)=0;
+            id(kiln_target_6)=300;  id(kiln_rate_6)=150;  id(kiln_hold_6)=0;
+            return;
+          }
+
+          if (p == 2) { // Тест (TEST)
+            id(kiln_target_0)=1000; id(kiln_rate_0)=30;  id(kiln_hold_0)=0;
+            id(kiln_target_1)=1150; id(kiln_rate_1)=150;  id(kiln_hold_1)=0;
+            id(kiln_target_2)=800;  id(kiln_rate_2)=150;  id(kiln_hold_2)=0;
+            id(kiln_target_3)=570;  id(kiln_rate_3)=60;   id(kiln_hold_3)=0;
+            id(kiln_target_4)=300;  id(kiln_rate_4)=150;  id(kiln_hold_4)=0;
+            return;
+          }
+
+          if (p == 3) { // Глазурь 950 (GLAZE 950)
+            id(kiln_target_0)=110;  id(kiln_rate_0)=80;   id(kiln_hold_0)=20;
+            id(kiln_target_1)=200;  id(kiln_rate_1)=80;   id(kiln_hold_1)=30;
+            id(kiln_target_2)=600;  id(kiln_rate_2)=180;  id(kiln_hold_2)=10;
+            id(kiln_target_3)=950;  id(kiln_rate_3)=150;  id(kiln_hold_3)=30;
+            id(kiln_target_4)=700;  id(kiln_rate_4)=150;  id(kiln_hold_4)=0;
+            id(kiln_target_5)=500;  id(kiln_rate_5)=80;   id(kiln_hold_5)=0;
+            id(kiln_target_6)=300;  id(kiln_rate_6)=150;  id(kiln_hold_6)=0;
+            return;
+          }
+
+  - id: kiln_start_program
+    mode: restart
+    parameters:
+      p: int
+    then:
+      - lambda: |-
+          if (!id(kiln_temp).has_state()) {
+            id(ui_notice_code) = 901;
+            id(ui_notice_ms) = millis();
+            return;
+          }
+      - script.execute:
+          id: kiln_load_program
+          p: !lambda "return p;"
+      - lambda: |-
+          // hard safety gate
+          id(heat_allowed) = true;
+          id(last_program) = p;
+          id(last_job_state) = 1; // in progress
+
+          // pick start segment based on current temperature (avoid cooling to initial low targets)
+          auto seg_tgt = [&](int s)->float {
+            switch (s) {
+              case 0: return id(kiln_target_0);
+              case 1: return id(kiln_target_1);
+              case 2: return id(kiln_target_2);
+              case 3: return id(kiln_target_3);
+              case 4: return id(kiln_target_4);
+              case 5: return id(kiln_target_5);
+              case 6: return id(kiln_target_6);
+              case 7: return id(kiln_target_7);
+              case 8: return id(kiln_target_8);
+              case 9: return id(kiln_target_9);
+              case 10: return id(kiln_target_10);
+              case 11: return id(kiln_target_11);
+              default: return -1.0f;
+            }
+          };
+          float current = id(kiln_temp).state;
+          int last_valid = 0;
+          for (int s = 0; s < id(kiln_max_segments); s++) {
+            float tgt = seg_tgt(s);
+            if (tgt < 0) break;
+            last_valid = s;
+            if (current <= tgt) { last_valid = s; break; }
+          }
+          int best_seg = last_valid;
+
+          id(kiln_state) = 1;         // RUN
+          id(kiln_segment) = best_seg;
+          id(kiln_stage) = 0;         // RAMP
+          id(abort_reason) = 0;
+
+          // timing init: if HA time not yet synced, stage_ts = 0; main loop will fix it
+          const int now_ts = id(ha_time).now().timestamp;
+          if (now_ts > 100) {
+            id(kiln_stage_ts) = now_ts;
+          } else {
+            id(kiln_stage_ts) = 0;
+          }
+
+          float safe_temp = id(kiln_temp).has_state() ? id(kiln_temp).state : 20.0f;
+          id(kiln_sp_start) = safe_temp;
+          id(kiln_sp) = id(kiln_sp_start);
+
+          // clear abort confirm UI if any
+          id(ui_abort_confirm) = false;
+          id(ui_abort_confirm_ms) = 0;
+          id(ui_notice_code) = 0;
+          id(ui_notice_ms) = 0;
+
+      - climate.control:
+          id: kiln_pid
+          mode: "HEAT"
+          target_temperature: !lambda "return id(kiln_sp);"
+
+  - id: kiln_resume_program
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(kiln_temp).has_state()) {
+            id(ui_notice_code) = 901;
+            id(ui_notice_ms) = millis();
+            return;
+          }
+
+          id(kiln_load_program).execute(id(last_program));
+          id(heat_allowed) = true;
+          id(last_job_state) = 1; // in progress
+
+          // pick nearest segment by target temperature to current T
+          auto seg_tgt = [&](int s)->float {
+            switch (s) {
+              case 0: return id(kiln_target_0);
+              case 1: return id(kiln_target_1);
+              case 2: return id(kiln_target_2);
+              case 3: return id(kiln_target_3);
+              case 4: return id(kiln_target_4);
+              case 5: return id(kiln_target_5);
+              case 6: return id(kiln_target_6);
+              case 7: return id(kiln_target_7);
+              case 8: return id(kiln_target_8);
+              case 9: return id(kiln_target_9);
+              case 10: return id(kiln_target_10);
+              case 11: return id(kiln_target_11);
+              default: return -1.0f;
+            }
+          };
+
+          float current = id(kiln_temp).state;
+          int best_seg = 0;
+          int last_valid = 0;
+          for (int s = 0; s < id(kiln_max_segments); s++) {
+            float tgt = seg_tgt(s);
+            if (tgt < 0) break;
+            last_valid = s;
+            if (current <= tgt) { last_valid = s; break; }
+          }
+          best_seg = last_valid;
+
+          id(kiln_state) = 1;
+          id(kiln_segment) = best_seg;
+          id(kiln_stage) = 0;
+
+          const int now_ts = id(ha_time).now().timestamp;
+          id(kiln_stage_ts) = now_ts > 100 ? now_ts : 0;
+
+          float safe_temp = id(kiln_temp).state;
+          id(kiln_sp_start) = safe_temp;
+          id(kiln_sp) = safe_temp;
+
+          id(ui_resume_confirm) = false;
+          id(ui_resume_choice) = true;
+          id(ui_screen) = 1;
+          id(ui_focus) = false;
+
+      - climate.control:
+          id: kiln_pid
+          mode: "HEAT"
+          target_temperature: !lambda "return id(kiln_sp);"
+
+  - id: manual_start
+    mode: restart
+    then:
+      - lambda: |-
+          ESP_LOGI("manual", "manual_start target=%.1f", id(ui_manual_target));
+      - climate.control:
+          id: kiln_pid
+          mode: "HEAT"
+          target_temperature: !lambda "return id(ui_manual_target) + 0.3f;"
+
+  - id: manual_stop
+    mode: restart
+    then:
+      - lambda: |-
+          ESP_LOGI("manual", "manual_stop");
+          id(ui_manual_active) = false;
+          id(ui_manual_edit) = false;
+          id(heat_allowed) = false;
+      - output.set_level:
+          id: kiln_power_raw
+          level: 0.0
+      - climate.control:
+          id: kiln_pid
+          mode: "OFF"
+
+  - id: ui_unlock
+    mode: restart
+    then:
+      - delay: 300ms
+      - lambda: |-
+          id(ui_lock) = false;
+
+  - id: kiln_finish_program
+    mode: restart
+    then:
+      - lambda: |-
+          id(heat_allowed) = false;
+          id(kiln_state) = 0;         // READY
+          id(kiln_segment) = 0;
+          id(kiln_stage) = 0;
+          id(kiln_stage_ts) = 0;
+          float safe_temp = id(kiln_temp).has_state() ? id(kiln_temp).state : 20.0f;
+          id(kiln_sp_start) = safe_temp;
+          id(kiln_sp) = id(kiln_sp_start);
+          id(ui_focus) = false;
+          id(ui_screen) = 1;
+          id(last_program) = id(kiln_program);
+          id(last_job_state) = 2; // success
+          // notice: DONE
+          id(ui_notice_code) = 200;
+          id(ui_notice_ms) = millis();
+
+      - climate.control:
+          id: kiln_pid
+          mode: "OFF"
+
+  - id: kiln_abort
+    mode: restart
+    then:
+      - lambda: |-
+          id(heat_allowed) = false;
+          id(kiln_state) = 2;         // ABORT/ALARM
+          id(ui_focus) = false;
+          id(ui_screen) = 1;
+          // notice: ALARM (abort_reason already set by watchdogs)
+          id(ui_notice_code) = 500;
+          id(ui_notice_ms) = millis();
+          id(ui_notice_text).clear();
+          id(last_program) = id(kiln_program);
+          id(last_job_state) = 3; // aborted
+          // clear abort confirm
+          id(ui_abort_confirm) = false;
+          id(ui_abort_confirm_ms) = 0;
+
+      - climate.control:
+          id: kiln_pid
+          mode: "OFF"
+
+  - id: kiln_reset_from_abort
+    mode: restart
+    then:
+      - lambda: |-
+          // Leave ALARM -> READY (heater must stay off until a new START)
+          id(heat_allowed) = false;
+          id(kiln_state) = 0;
+          id(abort_reason) = 0;
+
+          id(kiln_segment) = 0;
+          id(kiln_stage) = 0;
+          id(kiln_stage_ts) = 0;
+          float safe_temp = id(kiln_temp).has_state() ? id(kiln_temp).state : 20.0f;
+          id(kiln_sp_start) = safe_temp;
+          id(kiln_sp) = id(kiln_sp_start);
+
+          id(ui_focus) = false;
+          id(ui_screen) = 1;
+
+          id(ui_abort_confirm) = false;
+          id(ui_abort_confirm_ms) = 0;
+          id(ui_notice_code) = 0;
+          id(ui_notice_ms) = 0;
+
+      - climate.control:
+          id: kiln_pid
+          mode: "OFF"
+
+  # ==========================================================
+  # UI NAV MODEL (leader-grade):
+  #   BTN1 short = NEXT (screens or items)
+  #   BTN2 short = ENTER/SELECT (focus)
+  #   BTN2 long  = BACK/ABORT (with confirm in RUN)
+  # ==========================================================
+
+  # BTN1 SHORT
+  - id: ui_btn1_short
+    then:
+      - lambda: |-
+          if (id(ui_notice_text).size() > 0) {
+            id(ui_notice_text).clear();
+            id(ui_notice_ms) = 0;
+          }
+
+          if (id(ui_resume_confirm)) {
+            id(ui_resume_choice) = !id(ui_resume_choice);
+            return;
+          }
+
+          if (id(ui_manual_edit)) {
+            float next = id(ui_manual_target) + 5.0f;
+            if (next > 1150.0f) next = 20.0f;
+            id(ui_manual_target) = roundf(next / 5.0f) * 5.0f;
+            ESP_LOGI("manual", "edit+5 target=%.1f", id(ui_manual_target));
+            return;
+          }
+
+          // В аварии: навигация запрещена
+          if (id(kiln_state) == 2) return;
+
+          // Если ждём подтверждение аварии — любой другой клик снимает запрос
+          if (id(ui_abort_confirm)) {
+            id(ui_abort_confirm) = false;
+            id(ui_abort_confirm_ms) = 0;
+            id(ui_notice_code) = 0;
+            id(ui_notice_ms) = 0;
+          }
+
+          // ===== MODE: SCREEN (не в меню) =====
+          if (!id(ui_focus)) {
+            if (id(kiln_state) == 1) {
+              // RUN: HOME(1) -> TIME(5) -> DIAG(6) -> HOME
+              if (id(ui_screen) == 1) id(ui_screen) = 5;
+              else if (id(ui_screen) == 5) id(ui_screen) = 6;
+              else id(ui_screen) = 1;
+            } else {
+              // READY: HOME(1) -> PROGRAMS(2) -> MANUAL(7) -> DIAG(6) -> HOME
+              // If manual is already active, skip MANUAL screen (only HOME/PROGRAMS/DIAG)
+              if (id(ui_manual_active)) {
+                if (id(ui_screen) == 1) id(ui_screen) = 2;
+                else if (id(ui_screen) == 2) id(ui_screen) = 6;
+                else id(ui_screen) = 1;
+              } else {
+                if (id(ui_screen) == 1) id(ui_screen) = 2;
+                else if (id(ui_screen) == 2) id(ui_screen) = 7;
+                else if (id(ui_screen) == 7) id(ui_screen) = 6;
+                else id(ui_screen) = 1;
+              }
+            }
+            return;
+          }
+
+          // ===== MODE: INSIDE (в меню) =====
+          switch (id(ui_screen)) {
+            case 2: // PROGRAM LIST
+              id(ui_program_sel) = (id(ui_program_sel) + 1) % 4;
+              return;
+
+            case 3: // PROGRAM VIEW: прокрутка таблицы
+              id(ui_prog_scroll) = id(ui_prog_scroll) + 1;
+              if (id(ui_prog_scroll) > 50) id(ui_prog_scroll) = 0;
+              return;
+
+            case 4: // CONFIRM: ДА/НЕТ
+              id(ui_confirm) = !id(ui_confirm);
+              return;
+
+            default:
+              return;
+          }
+
+  # BTN1 LONG — reserved (можно потом повесить быстрый HOME)
+  - id: ui_btn1_long
+    then:
+      - lambda: |-
+          if (id(ui_notice_text).size() > 0) {
+            id(ui_notice_text).clear();
+            id(ui_notice_ms) = 0;
+          }
+          return;
+
+  # BTN2 SHORT
+  - id: ui_btn2_short
+    then:
+      - lambda: |-
+          uint32_t now_ms = millis();
+          if (id(ui_lock) || (now_ms - id(ui_last_action_ms)) < 300) {
+            return;
+          }
+          if (id(ui_notice_text).size() > 0) {
+            id(ui_notice_text).clear();
+            id(ui_notice_ms) = 0;
+          }
+
+          if (id(ui_resume_confirm)) {
+            if (id(ui_resume_choice)) {
+              id(kiln_resume_program).execute();
+            } else {
+              id(ui_resume_confirm) = false;
+            }
+            return;
+          }
+
+          if (id(ui_manual_edit)) {
+            if (id(ui_screen) != 7) {
+              id(ui_manual_edit) = false;
+              return;
+            }
+            if (!id(kiln_temp).has_state()) {
+              id(ui_notice_code) = 901;
+              id(ui_notice_ms) = millis();
+              return;
+            }
+            if (id(ui_manual_target) < 20.0f) id(ui_manual_target) = 20.0f;
+            if (id(ui_manual_target) > 1150.0f) id(ui_manual_target) = 1150.0f;
+            id(ui_manual_target) = roundf(id(ui_manual_target) / 5.0f) * 5.0f;
+            ESP_LOGI("manual", "confirm start target=%.1f", id(ui_manual_target));
+            id(ui_manual_edit) = false;
+            id(ui_manual_active) = true;
+            id(heat_allowed) = true;
+            id(kiln_sp) = id(ui_manual_target);
+            id(kiln_sp_start) = id(ui_manual_target);
+            id(kiln_state) = 0;
+            id(ui_screen) = 1;
+            id(ui_focus) = false;
+            id(manual_start).execute();
+            id(ui_lock) = true;
+            id(ui_last_action_ms) = millis();
+            id(ui_unlock).execute();
+            return;
+          }
+
+          // Если ждём подтверждение аварии — короткое снимает запрос
+          if (id(ui_abort_confirm)) {
+            id(ui_abort_confirm) = false;
+            id(ui_abort_confirm_ms) = 0;
+            id(ui_notice_code) = 0;
+            id(ui_notice_ms) = 0;
+            return;
+          }
+
+          // В аварии: короткое ничего не делает (действия — через LONG)
+          if (id(kiln_state) == 2) return;
+
+          // ===== MODE: SCREEN (не в меню) =====
+          if (!id(ui_focus)) {
+          if (id(kiln_state) == 0 && id(ui_screen) == 7) {
+            float start = id(kiln_temp).has_state() ? id(kiln_temp).state : 100.0f;
+            if (start < 20.0f) start = 20.0f;
+            if (start > 1150.0f) start = 1150.0f;
+            start = roundf(start / 5.0f) * 5.0f;
+            id(ui_manual_edit) = true;
+            id(ui_manual_target) = start;
+            ESP_LOGI("manual", "enter edit target=%.1f", id(ui_manual_target));
+            return;
+          }
+            // Вход в меню выбора программ только в READY и только на экране PROGRAMS
+            if (id(kiln_state) == 0 && id(ui_screen) == 2) {
+              id(ui_focus) = true;
+              id(ui_prog_scroll) = 0;
+            } else {
+              // иначе — быстро на HOME
+              id(ui_screen) = 1;
+            }
+            return;
+          }
+
+          // ===== MODE: INSIDE (в меню) =====
+          if (id(ui_screen) == 2) {
+            // Выбрали программу -> VIEW
+            id(kiln_program) = id(ui_program_sel);
+            id(kiln_load_program).execute(id(kiln_program));
+            id(ui_prog_scroll) = 0;
+            id(ui_screen) = 3;
+            return;
+          }
+
+          if (id(ui_screen) == 3) {
+            // VIEW -> CONFIRM
+            id(ui_confirm) = true;
+            id(ui_screen) = 4;
+            return;
+          }
+
+          if (id(ui_screen) == 4) {
+            // CONFIRM
+            if (!id(ui_confirm)) {
+              id(ui_screen) = 3;
+              return;
+            }
+            if (id(ui_manual_active)) {
+              id(ui_notice_text) = "Активен ручной режим";
+              id(ui_notice_ms) = millis();
+              return;
+            }
+            // START
+            id(ui_run_start_ms) = millis();
+            id(kiln_start_program).execute(id(kiln_program));
+            id(ui_focus) = false;
+            id(ui_screen) = 1;
+            return;
+          }
+
+  # BTN2 LONG (BACK / ABORT with confirm)
+  - id: ui_btn2_long
+    then:
+      - lambda: |-
+          if (id(ui_notice_text).size() > 0) {
+            id(ui_notice_text).clear();
+            id(ui_notice_ms) = 0;
+          }
+
+          if (id(ui_manual_edit)) {
+            id(ui_manual_edit) = false;
+            return;
+          }
+
+          if (id(ui_manual_active)) {
+            ESP_LOGI("manual", "manual stop");
+            id(ui_manual_active) = false;
+            id(heat_allowed) = false;
+            id(ui_screen) = 1;
+            id(ui_focus) = false;
+            id(manual_stop).execute();
+            id(ui_lock) = true;
+            id(ui_last_action_ms) = millis();
+            id(ui_unlock).execute();
+            return;
+          }
+
+          // ABORT confirm in RUN
+          if (id(kiln_state) == 1) {
+            // первый LONG -> запрос подтверждения
+            if (!id(ui_abort_confirm)) {
+              id(ui_abort_confirm) = true;
+              id(ui_abort_confirm_ms) = millis();
+              id(ui_notice_code) = 100; // код "подтверждение остановки"
+              id(ui_notice_ms) = millis();
+              return;
+            }
+            // второй LONG в окне 3 сек -> ABORT
+            if ((millis() - id(ui_abort_confirm_ms)) <= 3000) {
+              id(ui_abort_confirm) = false;
+              id(ui_abort_confirm_ms) = 0;
+              id(ui_notice_code) = 0;
+              id(ui_notice_ms) = 0;
+              id(kiln_abort).execute();
+              id(ui_lock) = true;
+              id(ui_last_action_ms) = millis();
+              id(ui_unlock).execute();
+              return;
+            }
+            // окно истекло — считаем заново
+            id(ui_abort_confirm) = true;
+            id(ui_abort_confirm_ms) = millis();
+            id(ui_notice_code) = 100;
+            id(ui_notice_ms) = millis();
+            id(ui_lock) = true;
+            id(ui_last_action_ms) = millis();
+            id(ui_unlock).execute();
+            return;
+          }
+
+          // В аварии: оставить поведение как было (reset/continue — отдельными кнопками у вас)
+          if (id(kiln_state) == 2) {
+            id(kiln_reset_from_abort).execute();
+            id(ui_lock) = true;
+            id(ui_last_action_ms) = millis();
+            id(ui_unlock).execute();
+            return;
+          }
+
+          // READY: выход из меню / назад на HOME
+          if (id(ui_focus)) {
+            id(ui_focus) = false;
+            // если были внутри VIEW/CONFIRM — возвращаемся на список программ
+            if (id(ui_screen) == 3 || id(ui_screen) == 4) id(ui_screen) = 2;
+            id(ui_lock) = true;
+            id(ui_last_action_ms) = millis();
+            id(ui_unlock).execute();
+            return;
+          }
+          id(ui_screen) = 1;
+          id(ui_lock) = true;
+          id(ui_last_action_ms) = millis();
+          id(ui_unlock).execute();
+          id(ui_lock) = true;
+          id(ui_last_action_ms) = millis();
+          id(ui_unlock).execute();
+
+
+binary_sensor:
+  - platform: gpio
+    id: btn1
+    name: "BTN1"
+    pin:
+      number: 32
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+
+    on_press:
+      - lambda: |-
+          id(btn1_down_ms) = millis();
+
+    on_release:
+      - lambda: |-
+          const uint32_t dt = millis() - id(btn1_down_ms);
+          // короткое: 50..700
+          if (dt >= 50 && dt <= 700) {
+            id(ui_btn1_short).execute();
+            id(btn1_down_ms) = 0;
+            return;
+          }
+          // длинное: >= 800
+          if (dt >= 800) {
+            id(ui_btn1_long).execute();
+            id(btn1_down_ms) = 0;
+            return;
+          }
+          // 701..799 и <50 — игнор (шум/пограничное)
+          id(btn1_down_ms) = 0;
+          return;
+
+  - platform: gpio
+    id: btn2
+    name: "BTN2"
+    pin:
+      number: 33
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+
+    on_press:
+      - lambda: |-
+          id(btn2_long_fired) = false;
+          id(btn2_down_ms) = millis();
+
+    on_release:
+      - lambda: |-
+          const uint32_t dt = millis() - id(btn2_down_ms);
+          if (dt >= 800) {
+            id(btn2_long_fired) = true;
+            id(ui_btn2_long).execute();
+            id(btn2_down_ms) = 0;
+            return;
+          }
+          if (dt >= 50 && dt <= 700 && !id(btn2_long_fired)) {
+            id(ui_btn2_short).execute();
+            return;
+          }
+          if (dt >= 800) {
+            return;
+          }
+          return;
+#Добавляем источники для DIAG-экрана (IP/SSID)
+ 
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: kiln_ip
+      name: "Kiln IP"
+      update_interval: 300s
+    ssid:
+      id: kiln_ssid
+      name: "Kiln SSID"
+      update_interval: 300s
+
+
+
+
+###############################################################
+#   ВЫБОР ПРОГРАММЫ
+###############################################################
+select:
+  - platform: template
+    id: kiln_select_program
+    name: "Kiln Program"
+    optimistic: true
+    options:
+      - Corundum 1150
+      - Chamotte 1150
+      - TEST
+      - Glaze 950
+    on_value:
+      then:
+        - lambda: |-
+            if (x == "Corundum 1150") id(kiln_program)=0;
+            if (x == "Chamotte 1150") id(kiln_program)=1;
+            if (x == "TEST")          id(kiln_program)=2;
+            if (x == "Glaze 950")     id(kiln_program)=3;
+            id(kiln_load_program).execute(id(kiln_program));
